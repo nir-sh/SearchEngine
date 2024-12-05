@@ -1,6 +1,7 @@
 package com.handson.searchengine.controller;
 
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.handson.searchengine.crawler.Crawler;
 import com.handson.searchengine.model.CrawlStatus;
 import com.handson.searchengine.model.CrawlStatusOut;
@@ -26,30 +27,27 @@ public class AppController {
     Crawler crawler;
 
     @RequestMapping(value = "/crawl", method = RequestMethod.POST)
-    public CrawlStatusOut crawl(@RequestBody CrawlerRequest request) throws IOException, InterruptedException {
-        try {
-            String crawlId = generateCrawlId();
-            if (!request.getUrl().startsWith("http")) {
-                request.setUrl("https://" + request.getUrl());
-            }
-            CrawlStatus res = crawler.crawl(crawlId, request);
-            return CrawlStatusOut.of(res);
-
-        } catch (IOException e) {
-            logger.error("IOException occurred during crawling", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new CrawlStatusOut()).getBody();
-        } catch (InterruptedException e) {
-            logger.error("InterruptedException occurred during crawling", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new CrawlStatusOut()).getBody();
-        } catch (Exception e) {
-            // Generic catch-all to ensure you catch unexpected exceptions
-            logger.error("Unexpected error occurred during crawling", e);
-            return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
-                    .body(new CrawlStatusOut()).getBody();
+    public String crawl(@RequestBody CrawlerRequest request) throws IOException, InterruptedException {
+        String crawlId = generateCrawlId();
+        if (!request.getUrl().startsWith("http")) {
+            request.setUrl("https://" + request.getUrl());
         }
+        new Thread(()-> {
+            try {
+                crawler.crawl(crawlId, request);
+            }catch (Exception e) {
+                e.printStackTrace();
+            }
+        }).start();
+
+        return crawlId;
     }
+
+    @RequestMapping(value = "/crawl/{crawlId}", method = RequestMethod.GET)
+    public CrawlStatusOut getCrawl(@PathVariable String crawlId) throws JsonProcessingException {
+        return crawler.getCrawlInfo(crawlId);
+    }
+
 
     private String generateCrawlId() {
         String charPool = "ABCDEFHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";

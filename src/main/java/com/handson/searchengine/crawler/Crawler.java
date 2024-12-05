@@ -1,9 +1,8 @@
 package com.handson.searchengine.crawler;
 
-import com.handson.searchengine.model.CrawlStatus;
-import com.handson.searchengine.model.CrawlerRecord;
-import com.handson.searchengine.model.CrawlerRequest;
-import com.handson.searchengine.model.StopReason;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.handson.searchengine.model.*;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.joda.time.DateTime;
@@ -11,6 +10,8 @@ import org.joda.time.Duration;
 import org.jsoup.HttpStatusException;
 import org.jsoup.Jsoup;
 import org.jsoup.nodes.Document;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
@@ -33,35 +34,51 @@ public class Crawler {
     private int curDistance = 0;
     private long startTime = 0;
     private StopReason stopReason;
-    public CrawlStatus crawl(String crawlId, CrawlerRequest crawlerRequest) throws InterruptedException, IOException {
-        visitedUrls.clear();
+
+    @Autowired
+    RedisTemplate redisTemplate;
+
+    @Autowired
+    ObjectMapper om;
+
+    public void crawl(String crawlId, CrawlerRequest crawlerRequest) throws InterruptedException, IOException {
+        initCrawlInRedis(crawlId);
         queue.clear();
         curDistance = 0;
         startTime = System.currentTimeMillis();
         stopReason = null;
+
         queue.put(CrawlerRecord.of(crawlId, crawlerRequest));
-        while (!queue.isEmpty() && getStopReason(queue.peek()) == null) {
+        CrawlerRecord record = null;
+        while (!queue.isEmpty() && stopReason == null) {
 
             try {
-                CrawlerRecord rec = queue.poll();
-                logger.info("crawling url:" + rec.getUrl());
-                Document webPageContent = Jsoup.connect(rec.getUrl()).get();
-                List<String> innerUrls = extractWebPageUrls(rec.getBaseUrl(), webPageContent);
-                addUrlsToQueue(rec, innerUrls, rec.getDistance() +1);
+                record = queue.poll();
+                logger.info("crawling url:" + record.getUrl());
+                setCrawlStatus(record.getCrawlId(),CrawlStatus.of(record.getDistance(), record.getStartTime(), 0, null));
+                Document webPageContent = Jsoup.connect(record.getUrl()).get();
+                List<String> innerUrls = extractWebPageUrls(record.getBaseUrl(), webPageContent);
+                addUrlsToQueue(record, innerUrls, record.getDistance() +1);
+
             } catch (HttpStatusException e) {
                 // Handle specific HTTP errors like 404
                 String errorMessage = "HTTP error fetching URL. Status=" + e.getStatusCode() + ", URL=" + e.getUrl();
                 logger.error(errorMessage);
             }
+            finally {
+                stopReason = queue.isEmpty() ? null : getStopReason(queue.peek());
+            }
         }
-        stopReason = queue.isEmpty() ? null : getStopReason(queue.peek());
-        return CrawlStatus.of(curDistance, startTime, visitedUrls.size(), stopReason);
+
+
+        var distance = queue.isEmpty() ? (record != null ? record.getDistance() : 0) : queue.peek().getDistance(); // Added to handle case of queue empty or no records created
+        setCrawlStatus(crawlId, CrawlStatus.of(distance, startTime, 0, stopReason));  //todo: we put 0 in numPages, because anyway when pulling the crawlInfo we fetch the numPages form redis. This makes numPages redundant, consider remove it from signature
 
     }
 
     private StopReason getStopReason(CrawlerRecord rec) {
         if (rec.getDistance() == rec.getMaxDistance() +1) return StopReason.maxDistance;
-        if (visitedUrls.size() >= rec.getMaxUrls()) return StopReason.maxUrls;
+        if (getVisitedUrls(rec.getCrawlId()) >= rec.getMaxUrls()) return StopReason.maxUrls;
         if (System.currentTimeMillis() >= rec.getMaxTime()) return StopReason.timeout;
         return null;
     }
@@ -69,10 +86,8 @@ public class Crawler {
 
     private void addUrlsToQueue(CrawlerRecord rec, List<String> urls, int distance) throws InterruptedException {
         logger.info(">> adding urls to queue: distance->" + distance + " amount->" + urls.size());
-        curDistance = distance;
         for (String url : urls) {
-            if (!visitedUrls.contains(url)) {
-                visitedUrls.add(url);
+            if (!crawlHasVisited(rec, url)) {
                 queue.put(CrawlerRecord.of(rec).withUrl(url).withIncDistance()) ;
             }
         }
@@ -87,6 +102,35 @@ public class Crawler {
         logger.info(">> extracted->" + links.size() + " links");
 
         return links;
+    }
+
+    private void initCrawlInRedis(String crawlId) throws JsonProcessingException {
+        setCrawlStatus(crawlId, CrawlStatus.of(0, System.currentTimeMillis(),0,  null));
+        redisTemplate.opsForValue().set(crawlId + ".urls.count","1");
+    }
+    private void setCrawlStatus(String crawlId, CrawlStatus crawlStatus) throws JsonProcessingException {
+        redisTemplate.opsForValue().set(crawlId + ".status", om.writeValueAsString(crawlStatus));
+    }
+
+    private boolean crawlHasVisited(CrawlerRecord rec, String url) {
+        if ( redisTemplate.opsForValue().setIfAbsent(rec.getCrawlId() + ".urls." + url, "1")) {
+            redisTemplate.opsForValue().increment(rec.getCrawlId() + ".urls.count",1L);
+            return false;
+        } else {
+            return true;
+        }
+    }
+
+    private int getVisitedUrls(String crawlId) {
+        Object curCount = redisTemplate.opsForValue().get(crawlId + ".urls.count");
+        if (curCount == null) return 0;
+        return Integer.parseInt(curCount.toString());
+    }
+
+    public CrawlStatusOut getCrawlInfo(String crawlId) throws JsonProcessingException {
+        CrawlStatus cs = om.readValue(redisTemplate.opsForValue().get(crawlId + ".status").toString(),CrawlStatus.class);
+        cs.setNumPages(getVisitedUrls(crawlId));
+        return CrawlStatusOut.of(cs);
     }
 
 
