@@ -2,7 +2,9 @@ package com.handson.searchengine.crawler;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.handson.searchengine.kafka.Producer;
 import com.handson.searchengine.model.*;
+import com.handson.searchengine.util.ElasticSearch;
 import org.apache.commons.logging.Log;
 import org.apache.commons.logging.LogFactory;
 import org.joda.time.DateTime;
@@ -30,7 +32,7 @@ public class Crawler {
 
     public static final int MAX_CAPACITY = 100000;
     private Set<String> visitedUrls = new HashSet<>();
-    private BlockingQueue<CrawlerRecord> queue = new ArrayBlockingQueue<CrawlerRecord>(MAX_CAPACITY);
+
     private int curDistance = 0;
     private long startTime = 0;
     private StopReason stopReason;
@@ -41,39 +43,43 @@ public class Crawler {
     @Autowired
     ObjectMapper om;
 
+    @Autowired
+    Producer producer;
+
+    @Autowired
+    ElasticSearch elasticSearch;
+
     public void crawl(String crawlId, CrawlerRequest crawlerRequest) throws InterruptedException, IOException {
         initCrawlInRedis(crawlId);
-        queue.clear();
-        curDistance = 0;
-        startTime = System.currentTimeMillis();
-        stopReason = null;
+        producer.send(CrawlerRecord.of(crawlId, crawlerRequest));
+    }
 
-        queue.put(CrawlerRecord.of(crawlId, crawlerRequest));
-        CrawlerRecord record = null;
-        while (!queue.isEmpty() && stopReason == null) {
+    public void crawlOneRecord(CrawlerRecord record) throws IOException, InterruptedException {
+        try {
+            logger.info("crawling url:" + record.getUrl());
 
-            try {
-                record = queue.poll();
-                logger.info("crawling url:" + record.getUrl());
-                setCrawlStatus(record.getCrawlId(),CrawlStatus.of(record.getDistance(), record.getStartTime(), 0, null));
+            StopReason stopReason = getStopReason(record);
+            setCrawlStatus(record.getCrawlId(),CrawlStatus.of(record.getDistance(), record.getStartTime(), 0, stopReason));
+
+            if (stopReason == null) {
                 Document webPageContent = Jsoup.connect(record.getUrl()).get();
+                indexElasticSearch(record, webPageContent);
                 List<String> innerUrls = extractWebPageUrls(record.getBaseUrl(), webPageContent);
                 addUrlsToQueue(record, innerUrls, record.getDistance() +1);
+            }
 
-            } catch (HttpStatusException e) {
-                // Handle specific HTTP errors like 404
-                String errorMessage = "HTTP error fetching URL. Status=" + e.getStatusCode() + ", URL=" + e.getUrl();
-                logger.error(errorMessage);
-            }
-            finally {
-                stopReason = queue.isEmpty() ? null : getStopReason(queue.peek());
-            }
+        } catch (HttpStatusException e) {
+            // Handle specific HTTP errors like 404
+            String errorMessage = "HTTP error fetching URL. Status=" + e.getStatusCode() + ", URL=" + e.getUrl();
+            logger.error(errorMessage);
         }
+    }
 
-
-        var distance = queue.isEmpty() ? (record != null ? record.getDistance() : 0) : queue.peek().getDistance(); // Added to handle case of queue empty or no records created
-        setCrawlStatus(crawlId, CrawlStatus.of(distance, startTime, 0, stopReason));  //todo: we put 0 in numPages, because anyway when pulling the crawlInfo we fetch the numPages form redis. This makes numPages redundant, consider remove it from signature
-
+    private void indexElasticSearch(CrawlerRecord rec, Document webPageContent) {
+        logger.info(">> adding elastic search for webPage: " + rec.getUrl());
+        String text = String.join(" ", webPageContent.select("a[href]").eachText());
+        UrlSearchDoc searchDoc = UrlSearchDoc.of(rec.getCrawlId(), text, rec.getUrl(), rec.getBaseUrl(), rec.getDistance());
+        elasticSearch.addData(searchDoc);
     }
 
     private StopReason getStopReason(CrawlerRecord rec) {
@@ -84,11 +90,11 @@ public class Crawler {
     }
 
 
-    private void addUrlsToQueue(CrawlerRecord rec, List<String> urls, int distance) throws InterruptedException {
+    private void addUrlsToQueue(CrawlerRecord rec, List<String> urls, int distance) throws InterruptedException, JsonProcessingException {
         logger.info(">> adding urls to queue: distance->" + distance + " amount->" + urls.size());
         for (String url : urls) {
             if (!crawlHasVisited(rec, url)) {
-                queue.put(CrawlerRecord.of(rec).withUrl(url).withIncDistance()) ;
+                producer.send(CrawlerRecord.of(rec).withUrl(url).withIncDistance()) ;
             }
         }
     }
